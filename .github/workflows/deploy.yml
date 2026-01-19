@@ -672,7 +672,7 @@ jobs:
             if [ -f /etc/suricata/rules/custom.rules ]; then
               NMAP_RULES_COUNT=$(sudo grep -c "NMAP\|OS Fingerprinting" /etc/suricata/rules/custom.rules 2>/dev/null || echo "0")
               if [ "$NMAP_RULES_COUNT" -gt 0 ]; then
-                echo "✅ Найдено правил nmap: $NMAP_RULES_COUNT"
+                echo "✅ Найдено правил nmap в файле: $NMAP_RULES_COUNT"
                 sudo grep -E "NMAP|OS Fingerprinting" /etc/suricata/rules/custom.rules | head -7
               else
                 echo "⚠️ Правила nmap не найдены в custom.rules"
@@ -682,12 +682,35 @@ jobs:
               exit 1
             fi
 
+            # Проверяем, что Suricata загрузила правила
+            echo ""
+            echo "→ Проверка загрузки правил в Suricata..."
+            if [ -f /var/run/suricata.pid ]; then
+              PID=$(cat /var/run/suricata.pid)
+              if kill -0 "$PID" 2>/dev/null; then
+                echo "  ✅ Suricata работает (PID: $PID)"
+                # Проверяем логи на наличие информации о загруженных правилах
+                if sudo grep -q "rules successfully loaded" /var/log/suricata/suricata.log 2>/dev/null; then
+                  RULES_LOADED=$(sudo grep "rules successfully loaded" /var/log/suricata/suricata.log | tail -1 | grep -oE "[0-9]+ rules" || echo "unknown")
+                  echo "  ✅ Правила загружены: $RULES_LOADED"
+                else
+                  echo "  ⚠️ Информация о загрузке правил не найдена в логах"
+                fi
+              else
+                echo "  ❌ Suricata не работает!"
+                exit 1
+              fi
+            else
+              echo "  ❌ PID файл Suricata не найден!"
+              exit 1
+            fi
+
             # Функция для проверки событий в логах Suricata
             check_suricata_event() {
               local search_pattern="$1"
               local expected_type="$2"  # "drop" или "alert"
               local description="$3"
-              sleep 2  # Даем время Suricata обработать события
+              sleep 3  # Даем время Suricata обработать события
               
               if sudo grep -q "$search_pattern" /var/log/suricata/eve.json 2>/dev/null; then
                 EVENT_COUNT=$(sudo grep -c "$search_pattern" /var/log/suricata/eve.json)
@@ -703,78 +726,128 @@ jobs:
                 fi
               else
                 echo "  ❌ $description: события не найдены в логах"
+                # Диагностика: проверяем, видит ли Suricata вообще какой-то трафик
+                echo "    Диагностика: проверка общего трафика в логах..."
+                TOTAL_EVENTS=$(sudo wc -l < /var/log/suricata/eve.json 2>/dev/null || echo "0")
+                echo "    Всего событий в eve.json: $TOTAL_EVENTS"
+                if [ "$TOTAL_EVENTS" -gt 0 ]; then
+                  echo "    Последние 3 события:"
+                  sudo tail -n 3 /var/log/suricata/eve.json 2>/dev/null | jq -r '"\(.event_type // "unknown") | src:\(.src_ip // "N/A") | dst:\(.dest_ip // "N/A")"' 2>/dev/null || true
+                fi
                 return 1
               fi
             }
 
+            # Проверка, что Suricata видит трафик вообще
+            echo ""
+            echo "→ Предварительная проверка: Suricata видит ли трафик?"
+            INITIAL_EVENTS=$(sudo wc -l < /var/log/suricata/eve.json 2>/dev/null || echo "0")
+            echo "  Событий до тестов: $INITIAL_EVENTS"
+            
+            # Делаем простой HTTP запрос для проверки
+            docker exec attacker timeout 3 curl -s http://victim &>/dev/null || true
+            sleep 2
+            AFTER_HTTP_EVENTS=$(sudo wc -l < /var/log/suricata/eve.json 2>/dev/null || echo "0")
+            if [ "$AFTER_HTTP_EVENTS" -gt "$INITIAL_EVENTS" ]; then
+              echo "  ✅ Suricata видит трафик (событий стало: $AFTER_HTTP_EVENTS)"
+            else
+              echo "  ⚠️ Suricata может не видеть трафик (событий не изменилось)"
+              echo "  Проверка iptables правил:"
+              sudo iptables -L DOCKER-USER -n -v | head -5 || true
+              sudo iptables -L PRE-SURICATA -n -v 2>/dev/null | head -5 || true
+            fi
+
             # Тест 1: SYN scan (должен блокироваться - drop)
+            # Используем более агрессивное сканирование с большим количеством портов
             echo ""
             echo "→ Тест 1: SYN scan (nmap -sS) - ожидается блокировка (drop)..."
-            docker exec attacker timeout 10 nmap -sS -p 80,443,22,8080 "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем интенсивное сканирование (100 портов, быстро)..."
+            docker exec attacker timeout 15 nmap -sS -T4 --max-retries 1 -p 1-100 "$VICTIM_IP" &>/dev/null || true
+            sleep 4
             if check_suricata_event "NMAP SYN Scan Blocked" "drop" "SYN scan блокировка"; then
               echo "  ✅ SYN scan успешно заблокирован"
             else
-              echo "  ⚠️ SYN scan не заблокирован или не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ SYN scan не заблокирован или не детектирован"
+              echo "  Проверяем все события с SYN флагом:"
+              sudo grep -E "flags.*S" /var/log/suricata/eve.json 2>/dev/null | tail -3 | jq -r '.event_type, .src_ip, .dest_ip' 2>/dev/null || echo "  События с SYN не найдены"
             fi
 
             # Тест 2: XMAS scan (должен детектироваться - alert)
             echo ""
             echo "→ Тест 2: XMAS scan (nmap -sX) - ожидается детектирование (alert)..."
-            docker exec attacker timeout 10 nmap -sX -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем интенсивное сканирование (50 портов)..."
+            docker exec attacker timeout 15 nmap -sX -T4 --max-retries 1 -p 1-50 "$VICTIM_IP" &>/dev/null || true
+            sleep 4
             if check_suricata_event "NMAP XMAS Scan Detected" "alert" "XMAS scan детектирование"; then
               echo "  ✅ XMAS scan успешно детектирован"
             else
-              echo "  ⚠️ XMAS scan не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ XMAS scan не детектирован"
+              echo "  Проверяем события с флагами FPU:"
+              sudo grep -E "flags.*[FPU]" /var/log/suricata/eve.json 2>/dev/null | tail -3 | jq -r '.event_type, .src_ip' 2>/dev/null || echo "  События с FPU не найдены"
             fi
 
             # Тест 3: UDP scan (должен блокироваться - drop)
             echo ""
             echo "→ Тест 3: UDP scan (nmap -sU) - ожидается блокировка (drop)..."
-            docker exec attacker timeout 10 nmap -sU -p 53,123,161 "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем интенсивное UDP сканирование (50 портов)..."
+            docker exec attacker timeout 20 nmap -sU -T4 --max-retries 1 -p 1-50 "$VICTIM_IP" &>/dev/null || true
+            sleep 4
             if check_suricata_event "NMAP UDP Scan Blocked" "drop" "UDP scan блокировка"; then
               echo "  ✅ UDP scan успешно заблокирован"
             else
-              echo "  ⚠️ UDP scan не заблокирован или не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ UDP scan не заблокирован или не детектирован"
+              echo "  Проверяем UDP события:"
+              sudo grep -E '"udp"' /var/log/suricata/eve.json 2>/dev/null | tail -3 | jq -r '.event_type, .src_ip, .dest_ip' 2>/dev/null || echo "  UDP события не найдены"
             fi
 
             # Тест 4: OS fingerprinting (должен детектироваться - alert)
             echo ""
             echo "→ Тест 4: OS fingerprinting (nmap -O) - ожидается детектирование (alert)..."
-            docker exec attacker timeout 15 nmap -O "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем OS fingerprinting..."
+            docker exec attacker timeout 20 nmap -O -T4 "$VICTIM_IP" &>/dev/null || true
+            sleep 5
             if check_suricata_event "OS Fingerprinting Attempt" "alert" "OS fingerprinting детектирование"; then
               echo "  ✅ OS fingerprinting успешно детектирован"
             else
-              echo "  ⚠️ OS fingerprinting не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ OS fingerprinting не детектирован"
+              echo "  Проверяем события с ipopts:"
+              sudo grep -E "ipopts" /var/log/suricata/eve.json 2>/dev/null | tail -3 | jq -r '.event_type, .src_ip' 2>/dev/null || echo "  События с ipopts не найдены"
             fi
 
             # Тест 5: ACK scan (должен детектироваться - alert)
             echo ""
             echo "→ Тест 5: ACK scan (nmap -sA) - ожидается детектирование (alert)..."
-            docker exec attacker timeout 10 nmap -sA -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем интенсивное ACK сканирование (50 портов)..."
+            docker exec attacker timeout 15 nmap -sA -T4 --max-retries 1 -p 1-50 "$VICTIM_IP" &>/dev/null || true
+            sleep 4
             if check_suricata_event "NMAP ACK Scan Detected" "alert" "ACK scan детектирование"; then
               echo "  ✅ ACK scan успешно детектирован"
             else
-              echo "  ⚠️ ACK scan не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ ACK scan не детектирован"
             fi
 
             # Тест 6: FIN scan (должен детектироваться - alert)
             echo ""
             echo "→ Тест 6: FIN scan (nmap -sF) - ожидается детектирование (alert)..."
-            docker exec attacker timeout 10 nmap -sF -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем интенсивное FIN сканирование (50 портов)..."
+            docker exec attacker timeout 15 nmap -sF -T4 --max-retries 1 -p 1-50 "$VICTIM_IP" &>/dev/null || true
+            sleep 4
             if check_suricata_event "NMAP FIN Scan Detected" "alert" "FIN scan детектирование"; then
               echo "  ✅ FIN scan успешно детектирован"
             else
-              echo "  ⚠️ FIN scan не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ FIN scan не детектирован"
             fi
 
             # Тест 7: NULL scan (должен детектироваться - alert)
             echo ""
             echo "→ Тест 7: NULL scan (nmap -sN) - ожидается детектирование (alert)..."
-            docker exec attacker timeout 10 nmap -sN -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            echo "  Выполняем интенсивное NULL сканирование (50 портов)..."
+            docker exec attacker timeout 15 nmap -sN -T4 --max-retries 1 -p 1-50 "$VICTIM_IP" &>/dev/null || true
+            sleep 4
             if check_suricata_event "NMAP NULL Scan Detected" "alert" "NULL scan детектирование"; then
               echo "  ✅ NULL scan успешно детектирован"
             else
-              echo "  ⚠️ NULL scan не детектирован (может потребоваться больше пакетов для threshold)"
+              echo "  ⚠️ NULL scan не детектирован"
             fi
 
             # Итоговая статистика
