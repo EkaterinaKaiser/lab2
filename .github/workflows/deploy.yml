@@ -44,11 +44,20 @@ jobs:
             fi
 
             # Удаляем контейнеры по имени (на случай сбоя compose)
-            docker rm -f attacker victim 2>/dev/null || true
+            docker rm -f attacker victim evebox 2>/dev/null || true
 
-            # Удаляем сеть (если существует)
+            # Удаляем все существующие сети проекта (включая с конфликтующими подсетями)
+            echo "Удаление существующих сетей..."
             docker network rm labnet 2>/dev/null || true
             docker network rm lab-infrastructure_labnet 2>/dev/null || true
+            
+            # Удаляем все неиспользуемые сети (включая те, что могут конфликтовать)
+            docker network prune -f 2>/dev/null || true
+            
+            # Удаляем все сети, содержащие "lab" в названии (для безопасности)
+            for net in $(docker network ls --format "{{.Name}}" | grep -E "lab|infrastructure"); do
+              docker network rm "$net" 2>/dev/null || true
+            done
 
             # Очищаем папку
             rm -rf ~/lab-infrastructure
@@ -344,8 +353,13 @@ jobs:
             set -e
             cd ~/lab-infrastructure
 
-            docker network create labnet 2>/dev/null || true
+            # Удаляем существующие сети проекта перед созданием новых
+            echo "Очистка существующих сетей..."
+            docker network rm labnet 2>/dev/null || true
+            docker network rm lab-infrastructure_labnet 2>/dev/null || true
+            docker network prune -f 2>/dev/null || true
 
+            echo "Запуск контейнеров..."
             docker compose up -d --build
 
             echo "Контейнеры запущены:"
