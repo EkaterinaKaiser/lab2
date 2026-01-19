@@ -551,14 +551,14 @@ jobs:
               echo "  Последние события Suricata (HTTP/drop):"
               sudo tail -n 50 /var/log/suricata/eve.json 2>/dev/null | grep -E '"http"|"drop"|"alert"' | tail -10 | jq -r 'select(.event_type=="drop" or .event_type=="alert") | "\(.event_type) | src:\(.src_ip // "N/A") | dst:\(.dest_ip // "N/A") | sig:\(.alert.signature // "N/A")"' 2>/dev/null || echo "  Нет событий HTTP/drop"
               echo "  IP адрес attacker контейнера:"
-              ATTACKER_IP=$(docker inspect attacker 2>/dev/null | jq -r '.[0].NetworkSettings.Networks.labnet.IPAddress // .[0].NetworkSettings.Networks.lab-infrastructure_labnet.IPAddress // empty')
+              ATTACKER_IP=$(docker inspect attacker 2>/dev/null | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.IPAddress // empty')
               if [ -n "$ATTACKER_IP" ]; then
                 echo "  $ATTACKER_IP"
               else
                 docker inspect attacker 2>/dev/null | grep -i ipaddress | head -1 || echo "  Не удалось определить IP"
               fi
               echo "  IP адрес victim контейнера:"
-              VICTIM_IP=$(docker inspect victim 2>/dev/null | jq -r '.[0].NetworkSettings.Networks.labnet.IPAddress // .[0].NetworkSettings.Networks.lab-infrastructure_labnet.IPAddress // empty')
+              VICTIM_IP=$(docker inspect victim 2>/dev/null | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.IPAddress // empty')
               if [ -n "$VICTIM_IP" ]; then
                 echo "  $VICTIM_IP"
               else
@@ -653,7 +653,7 @@ jobs:
             sleep 3
 
             # Получаем IP адрес victim контейнера
-            VICTIM_IP=$(docker inspect victim 2>/dev/null | jq -r '.[0].NetworkSettings.Networks.labnet.IPAddress // .[0].NetworkSettings.Networks.lab-infrastructure_labnet.IPAddress // empty')
+            VICTIM_IP=$(docker inspect victim 2>/dev/null | jq -r '.[0].NetworkSettings.Networks | to_entries[0].value.IPAddress // empty')
             if [ -z "$VICTIM_IP" ]; then
               echo "❌ Не удалось получить IP адрес victim контейнера"
               docker inspect victim | grep -i ipaddress | head -1
