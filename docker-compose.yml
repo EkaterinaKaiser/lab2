@@ -34,6 +34,29 @@ services:
         apt-get install -y -qq iputils-ping curl netcat-openbsd nmap wget tcpdump &&
         tail -f /dev/null
       "
+
+  evebox:
+    image: jasonish/evebox:latest
+    container_name: evebox
+    hostname: evebox
+    networks:
+      - labnet
+    ports:
+      - "5636:5636"
+    volumes:
+      - /var/log/suricata:/var/log/suricata:ro
+    environment:
+      - EVEBOX_ELASTICSEARCH_ENABLED=false
+      - EVEBOX_ELASTICSEARCH_URL=
+      - EVEBOX_DATABASE_TYPE=sqlite
+      - EVEBOX_DATABASE_NAME=/var/log/suricata/evebox.db
+      - EVEBOX_EVE_LOG_DIR=/var/log/suricata
+      - EVEBOX_EVE_LOG_PATTERN=eve.json
+    command: >
+      sh -c "
+        evebox --no-version-check --database sqlite --sqlite-file /var/log/suricata/evebox.db --datastore sqlite --input /var/log/suricata/eve.json --host 0.0.0.0 --port 5636
+      "
+    restart: unless-stopped
       
 networks:
   labnet:

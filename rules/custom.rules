@@ -1,1 +1,27 @@
+# Блокировка ICMP трафика
 drop icmp any any -> any any (msg:"ICMP blocked"; sid:1000001; rev:1;)
+
+# ============================================
+# Правила для детектирования и блокировки nmap сканирований
+# ============================================
+
+# Блокировка SYN scan (nmap -sS)
+drop tcp any any -> any any (flags:S; msg:"[IPS] NMAP SYN Scan Blocked"; threshold: type both, track by_src, count 10, seconds 6; sid:1001001; rev:1;)
+
+# Детектирование XMAS scan (nmap -sX)
+alert tcp any any -> any any (flags:FPU; msg:"[IDS] NMAP XMAS Scan Detected"; threshold: type both, track by_src, count 5, seconds 6; sid:1001002; rev:1;)
+
+# Блокировка UDP scan (nmap -sU)
+drop udp any any -> any any (msg:"[IPS] NMAP UDP Scan Blocked"; threshold: type both, track by_src, count 10, seconds 10; sid:1001003; rev:1;)
+
+# Детектирование OS fingerprinting (nmap -O)
+alert ip any any -> any any (msg:"[IDS] Possible OS Fingerprinting Attempt"; ipopts: any; threshold: type both, track by_src, count 5, seconds 20; sid:1001101; rev:1;)
+
+# Детектирование ACK scan (nmap -sA)
+alert tcp any any -> any any (flags:A; msg:"[IDS] NMAP ACK Scan Detected"; threshold: type both, track by_src, count 5, seconds 10; sid:1001004; rev:1;)
+
+# Детектирование FIN scan (nmap -sF)
+alert tcp any any -> any any (flags:F; msg:"[IDS] NMAP FIN Scan Detected"; threshold: type both, track by_src, count 3, seconds 10; sid:1001005; rev:1;)
+
+# Детектирование NULL scan (nmap -sN)
+alert tcp any any -> any any (flags:0; msg:"[IDS] NMAP NULL Scan Detected"; threshold: type both, track by_src, count 2, seconds 10; sid:1001006; rev:1;)

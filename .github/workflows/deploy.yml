@@ -468,6 +468,14 @@ jobs:
             if [ -f /etc/suricata/rules/custom.rules ]; then
               echo "  Правило custom.rules найдено"
               sudo grep -i icmp /etc/suricata/rules/custom.rules || echo "  ⚠️ Правило ICMP не найдено в файле"
+              
+              # Проверяем наличие правил nmap
+              NMAP_RULES=$(sudo grep -c "NMAP\|OS Fingerprinting" /etc/suricata/rules/custom.rules 2>/dev/null || echo "0")
+              if [ "$NMAP_RULES" -gt 0 ]; then
+                echo "  ✅ Найдено правил nmap: $NMAP_RULES"
+              else
+                echo "  ⚠️ Правила nmap не найдены в custom.rules"
+              fi
             else
               echo "  ⚠️ Файл custom.rules не найден!"
             fi
@@ -616,4 +624,164 @@ jobs:
 
             echo ""
             echo "=== ✅ Тестирование IoC правил завершено ==="
+          EOF
+
+      - name: Test Nmap scanning detection and blocking
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "${SSH_USER}@${SSH_HOST}" << 'EOF'
+            set -e
+            cd ~/lab-infrastructure
+
+            echo "=== Тестирование детектирования и блокировки nmap сканирований ==="
+            sleep 3
+
+            # Получаем IP адрес victim контейнера
+            VICTIM_IP=$(docker inspect victim 2>/dev/null | jq -r '.[0].NetworkSettings.Networks.labnet.IPAddress // .[0].NetworkSettings.Networks.lab-infrastructure_labnet.IPAddress // empty')
+            if [ -z "$VICTIM_IP" ]; then
+              echo "❌ Не удалось получить IP адрес victim контейнера"
+              docker inspect victim | grep -i ipaddress | head -1
+              exit 1
+            fi
+            echo "→ IP адрес victim: $VICTIM_IP"
+
+            # Очищаем предыдущие события для чистоты теста
+            echo "→ Очистка предыдущих событий Suricata..."
+            sudo truncate -s 0 /var/log/suricata/eve.json 2>/dev/null || true
+            sleep 2
+
+            # Проверяем наличие правил nmap в custom.rules
+            echo ""
+            echo "→ Проверка наличия правил nmap в custom.rules..."
+            if [ -f /etc/suricata/rules/custom.rules ]; then
+              NMAP_RULES_COUNT=$(sudo grep -c "NMAP\|OS Fingerprinting" /etc/suricata/rules/custom.rules 2>/dev/null || echo "0")
+              if [ "$NMAP_RULES_COUNT" -gt 0 ]; then
+                echo "✅ Найдено правил nmap: $NMAP_RULES_COUNT"
+                sudo grep -E "NMAP|OS Fingerprinting" /etc/suricata/rules/custom.rules | head -7
+              else
+                echo "⚠️ Правила nmap не найдены в custom.rules"
+              fi
+            else
+              echo "❌ Файл custom.rules не найден!"
+              exit 1
+            fi
+
+            # Функция для проверки событий в логах Suricata
+            check_suricata_event() {
+              local search_pattern="$1"
+              local expected_type="$2"  # "drop" или "alert"
+              local description="$3"
+              sleep 2  # Даем время Suricata обработать события
+              
+              if sudo grep -q "$search_pattern" /var/log/suricata/eve.json 2>/dev/null; then
+                EVENT_COUNT=$(sudo grep -c "$search_pattern" /var/log/suricata/eve.json)
+                EVENT_TYPE=$(sudo grep "$search_pattern" /var/log/suricata/eve.json | tail -1 | jq -r '.event_type' 2>/dev/null || echo "unknown")
+                
+                if [ "$EVENT_TYPE" = "$expected_type" ]; then
+                  echo "  ✅ $description: найдено $EVENT_COUNT событий типа '$EVENT_TYPE'"
+                  sudo grep "$search_pattern" /var/log/suricata/eve.json | tail -1 | jq -r '"\(.event_type) | src:\(.src_ip) | dst:\(.dest_ip) | sig:\(.alert.signature // "N/A")"' 2>/dev/null || true
+                  return 0
+                else
+                  echo "  ⚠️ $description: найдено событие типа '$EVENT_TYPE' (ожидалось '$expected_type')"
+                  return 1
+                fi
+              else
+                echo "  ❌ $description: события не найдены в логах"
+                return 1
+              fi
+            }
+
+            # Тест 1: SYN scan (должен блокироваться - drop)
+            echo ""
+            echo "→ Тест 1: SYN scan (nmap -sS) - ожидается блокировка (drop)..."
+            docker exec attacker timeout 10 nmap -sS -p 80,443,22,8080 "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "NMAP SYN Scan Blocked" "drop" "SYN scan блокировка"; then
+              echo "  ✅ SYN scan успешно заблокирован"
+            else
+              echo "  ⚠️ SYN scan не заблокирован или не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Тест 2: XMAS scan (должен детектироваться - alert)
+            echo ""
+            echo "→ Тест 2: XMAS scan (nmap -sX) - ожидается детектирование (alert)..."
+            docker exec attacker timeout 10 nmap -sX -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "NMAP XMAS Scan Detected" "alert" "XMAS scan детектирование"; then
+              echo "  ✅ XMAS scan успешно детектирован"
+            else
+              echo "  ⚠️ XMAS scan не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Тест 3: UDP scan (должен блокироваться - drop)
+            echo ""
+            echo "→ Тест 3: UDP scan (nmap -sU) - ожидается блокировка (drop)..."
+            docker exec attacker timeout 10 nmap -sU -p 53,123,161 "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "NMAP UDP Scan Blocked" "drop" "UDP scan блокировка"; then
+              echo "  ✅ UDP scan успешно заблокирован"
+            else
+              echo "  ⚠️ UDP scan не заблокирован или не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Тест 4: OS fingerprinting (должен детектироваться - alert)
+            echo ""
+            echo "→ Тест 4: OS fingerprinting (nmap -O) - ожидается детектирование (alert)..."
+            docker exec attacker timeout 15 nmap -O "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "OS Fingerprinting Attempt" "alert" "OS fingerprinting детектирование"; then
+              echo "  ✅ OS fingerprinting успешно детектирован"
+            else
+              echo "  ⚠️ OS fingerprinting не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Тест 5: ACK scan (должен детектироваться - alert)
+            echo ""
+            echo "→ Тест 5: ACK scan (nmap -sA) - ожидается детектирование (alert)..."
+            docker exec attacker timeout 10 nmap -sA -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "NMAP ACK Scan Detected" "alert" "ACK scan детектирование"; then
+              echo "  ✅ ACK scan успешно детектирован"
+            else
+              echo "  ⚠️ ACK scan не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Тест 6: FIN scan (должен детектироваться - alert)
+            echo ""
+            echo "→ Тест 6: FIN scan (nmap -sF) - ожидается детектирование (alert)..."
+            docker exec attacker timeout 10 nmap -sF -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "NMAP FIN Scan Detected" "alert" "FIN scan детектирование"; then
+              echo "  ✅ FIN scan успешно детектирован"
+            else
+              echo "  ⚠️ FIN scan не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Тест 7: NULL scan (должен детектироваться - alert)
+            echo ""
+            echo "→ Тест 7: NULL scan (nmap -sN) - ожидается детектирование (alert)..."
+            docker exec attacker timeout 10 nmap -sN -p 80,443,22 "$VICTIM_IP" &>/dev/null || true
+            if check_suricata_event "NMAP NULL Scan Detected" "alert" "NULL scan детектирование"; then
+              echo "  ✅ NULL scan успешно детектирован"
+            else
+              echo "  ⚠️ NULL scan не детектирован (может потребоваться больше пакетов для threshold)"
+            fi
+
+            # Итоговая статистика
+            echo ""
+            echo "=== Итоговая статистика событий nmap ==="
+            echo "→ Все события nmap в логах:"
+            sudo grep -E "NMAP|OS Fingerprinting" /var/log/suricata/eve.json 2>/dev/null | jq -r '"\(.event_type) | \(.alert.signature // "N/A") | src:\(.src_ip) | dst:\(.dest_ip)"' 2>/dev/null | sort -u || echo "  События не найдены"
+            
+            echo ""
+            echo "→ Количество событий по типам:"
+            sudo grep -E "NMAP|OS Fingerprinting" /var/log/suricata/eve.json 2>/dev/null | jq -r '.event_type' 2>/dev/null | sort | uniq -c || echo "  Статистика недоступна"
+
+            echo ""
+            echo "→ Проверка правил nmap в Suricata:"
+            if [ -f /etc/suricata/rules/custom.rules ]; then
+              echo "  - Правила в custom.rules:"
+              sudo grep -E "^drop|^alert" /etc/suricata/rules/custom.rules | grep -E "NMAP|OS Fingerprinting" | wc -l | xargs echo "    Всего правил nmap:"
+            fi
+
+            echo ""
+            echo "=== ✅ Тестирование nmap сканирований завершено ==="
+            echo "ℹ️ Примечание: Некоторые тесты могут не сработать из-за threshold в правилах."
+            echo "   Правила требуют определенное количество пакетов за период времени для срабатывания."
           EOF

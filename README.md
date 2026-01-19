@@ -11,6 +11,8 @@
 - Генерация правил Suricata для блокировки IP-адресов
 - Автоматическое тестирование и деплой в облако
 - Блокировка ICMP трафика при разрешении HTTP
+- **Детектирование и блокировка nmap сканирований** (SYN, XMAS, UDP, OS fingerprinting, ACK, FIN, NULL)
+- **EveBox** — веб-интерфейс для управления оповещениями и событиями Suricata
 
 ## Структура проекта
 
@@ -21,9 +23,9 @@
 ├── update_rules.sh             # Полный pipeline обновления правил
 ├── Makefile                    # Автоматизация всех этапов
 ├── suricata.yaml               # Конфигурация Suricata
-├── docker-compose.yml          # Конфигурация Docker контейнеров
+├── docker-compose.yml          # Конфигурация Docker контейнеров (attacker, victim, evebox)
 ├── rules/
-│   └── custom.rules            # Базовые правила (блокировка ICMP)
+│   └── custom.rules            # Базовые правила (ICMP блокировка + nmap детектирование)
 └── .github/workflows/
     └── deploy.yml              # GitHub Actions workflow для деплоя
 ```
@@ -59,8 +61,18 @@ rule-files:
 
 **Содержимое:**
 - Правило `drop icmp any any -> any any` (SID: 1000001)
+- **Правила для детектирования и блокировки nmap сканирований:**
+  - `drop` SYN scan (nmap -sS) — SID: 1001001
+  - `alert` XMAS scan (nmap -sX) — SID: 1001002
+  - `drop` UDP scan (nmap -sU) — SID: 1001003
+  - `alert` OS fingerprinting (nmap -O) — SID: 1001101
+  - `alert` ACK scan (nmap -sA) — SID: 1001004
+  - `alert` FIN scan (nmap -sF) — SID: 1001005
+  - `alert` NULL scan (nmap -sN) — SID: 1001006
 
-**Назначение:** Блокировка всего ICMP трафика для демонстрации работы IPS.
+**Назначение:** 
+- Блокировка всего ICMP трафика для демонстрации работы IPS
+- Детектирование и блокировка различных техник сетевого сканирования с помощью nmap
 
 ### 3. suricata.rules (третий приоритет)
 
@@ -158,6 +170,61 @@ pass tcp any any -> $HOME_NET any (msg:"Allow TCP traffic to HOME_NET"; sid:8000
 drop ip 8.8.8.8 any -> $HOME_NET any (msg:"[IPS] Google Cloud IP 8.8.8.8 -> HOME_NET"; classtype:policy-violation; sid:9300001; rev:1;)
 ```
 
+### Тест 4: Детектирование и блокировка nmap сканирований
+
+**Ожидаемый результат:** Различные техники nmap сканирования должны детектироваться и блокироваться
+
+**Процесс:**
+1. Запуск контейнеров: `docker-compose up -d`
+2. Получение IP адреса victim: `docker inspect victim | grep IPAddress`
+3. Выполнение различных типов сканирования с контейнера attacker:
+   - **SYN scan (блокируется):** `nmap -sS <victim_ip>`
+   - **XMAS scan (детектируется):** `nmap -sX <victim_ip>`
+   - **UDP scan (блокируется):** `nmap -sU <victim_ip>`
+   - **OS fingerprinting (детектируется):** `nmap -O <victim_ip>`
+   - **ACK scan (детектируется):** `nmap -sA <victim_ip>`
+   - **FIN scan (детектируется):** `nmap -sF <victim_ip>`
+   - **NULL scan (детектируется):** `nmap -sN <victim_ip>`
+4. Проверка событий в логах Suricata: `/var/log/suricata/eve.json`
+5. Просмотр событий в EveBox: `http://localhost:5636`
+
+**Правила (в custom.rules):**
+```
+# Блокировка SYN scan
+drop tcp any any -> any any (flags:S; msg:"[IPS] NMAP SYN Scan Blocked"; threshold: type both, track by_src, count 10, seconds 6; sid:1001001; rev:1;)
+
+# Детектирование XMAS scan
+alert tcp any any -> any any (flags:FPU; msg:"[IDS] NMAP XMAS Scan Detected"; threshold: type both, track by_src, count 5, seconds 6; sid:1001002; rev:1;)
+
+# Блокировка UDP scan
+drop udp any any -> any any (msg:"[IPS] NMAP UDP Scan Blocked"; threshold: type both, track by_src, count 10, seconds 10; sid:1001003; rev:1;)
+```
+
+**Примечание:** Правила используют `threshold` для уменьшения ложных срабатываний. Сканирование должно быть достаточно интенсивным (несколько пакетов за короткий период времени).
+
+## EveBox — Веб-интерфейс для управления событиями Suricata
+
+**EveBox** — это веб-интерфейс для просмотра и управления оповещениями и событиями Suricata.
+
+### Доступ к EveBox
+
+После запуска контейнеров EveBox доступен по адресу:
+```
+http://localhost:5636
+```
+
+### Возможности EveBox
+
+- Просмотр всех событий Suricata в реальном времени
+- Фильтрация событий по типу, источнику, правилу и другим параметрам
+- Статистика по событиям и правилам
+- Детальный анализ заблокированных и детектированных атак
+- Экспорт данных для дальнейшего анализа
+
+### Запуск EveBox
+
+EveBox автоматически запускается вместе с другими контейнерами через `docker-compose up -d`. Контейнер использует SQLite базу данных для хранения событий и читает логи из `/var/log/suricata/eve.json`.
+
 ## Источники IoC данных
 
 ### Вредоносные IP-адреса
@@ -192,6 +259,13 @@ drop ip 8.8.8.8 any -> $HOME_NET any (msg:"[IPS] Google Cloud IP 8.8.8.8 -> HOME
 - `9900000-9909999`: Zapret-info
 - `9910000-9919999`: Роскомсвобода
 - `1000001`: ICMP блокировка (custom.rules)
+- `1001001`: NMAP SYN Scan (drop) — блокировка
+- `1001002`: NMAP XMAS Scan (alert) — детектирование
+- `1001003`: NMAP UDP Scan (drop) — блокировка
+- `1001004`: NMAP ACK Scan (alert) — детектирование
+- `1001005`: NMAP FIN Scan (alert) — детектирование
+- `1001006`: NMAP NULL Scan (alert) — детектирование
+- `1001101`: OS Fingerprinting (alert) — детектирование
 
 ## Конфигурация
 
